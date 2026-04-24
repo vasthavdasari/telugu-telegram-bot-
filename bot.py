@@ -7,15 +7,20 @@ What it does
     - Telugu text          -> polished casual English
     - Telugu voice message -> Telugu transcript + polished English
 
-Services used (all FREE, no credit card, Google-only stack)
-    - Telegram Bot API       unlimited, personal use
-    - Google Gemini 2.5      1000 req/day Flash-Lite (text) / 250 req/day Flash (audio)
-                             handles both translation AND voice transcription
+Providers (sequential fallback — only 1 API call per message on success)
+    - Telegram Bot API       unlimited, personal use, free
+    - Gemini 2.5 Flash       PRIMARY for text translation (best Telugu quality)
+    - Groq Llama 3.3 70B     FALLBACK for text if Gemini fails (1000 req/day)
+    - Groq Whisper Large v3  PRIMARY for voice transcription (2000 req/day)
+    - Gemini 2.5 multimodal  FALLBACK for voice if Groq Whisper fails
 
 Required environment variables
     TELEGRAM_BOT_TOKEN   from @BotFather
-    GEMINI_API_KEY       from aistudio.google.com/apikey
+    GEMINI_API_KEY       (optional) from aistudio.google.com/apikey
+    GROQ_API_KEY         (optional) from console.groq.com
     PORT                 optional; defaults to 8080 (health endpoint)
+
+    At least one of GEMINI_API_KEY or GROQ_API_KEY must be set.
 
 Stdlib only. No pip install needed.
 """
@@ -44,27 +49,36 @@ def _require_env(name):
 
 
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = _require_env("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Model fallback chains. Each model has its own separate daily quota on
-# the free tier — if the primary is exhausted (or hits a per-minute rate cap
-# that doesn't clear quickly), we cascade to the next model.
-# Priority: Flash (best translation quality) -> Flash-Lite (highest daily cap) -> Pro (fallback).
-# Text: Flash (250/day) -> Flash-Lite (1000/day) -> Pro (100/day) = 1350/day total.
-# Audio: Flash (250/day) -> Pro (100/day) = 350/day total.
-GEMINI_TEXT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
-GEMINI_AUDIO_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+if not (GEMINI_API_KEY or GROQ_API_KEY):
+    print("ERROR: at least one of GEMINI_API_KEY or GROQ_API_KEY must be set.", flush=True)
+    sys.exit(1)
+
+# Provider priority — SEQUENTIAL fallback, never parallel:
+#   Text:  Gemini 2.5 Flash (quality) -> Groq Llama 3.3 70B (capacity)
+#   Voice: Groq Whisper Large v3 (purpose-built) -> Gemini 2.5 Flash multimodal (fallback)
+# If the primary succeeds, only 1 API call per user message. Fallback only runs
+# when the primary raises an error.
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"
+GEMINI_AUDIO_MODEL = "gemini-2.5-flash"
+GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
+GROQ_WHISPER_MODEL = "whisper-large-v3"
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
+GEMINI_URL_TMPL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
 
 def _gemini_url(model):
-    return (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{model}:generateContent"
-    )
+    return GEMINI_URL_TMPL.format(model=model)
 
 
 POLL_TIMEOUT = 30
@@ -715,9 +729,6 @@ def _gemini_post(model, body, timeout, max_retries=2):
     return False, "retries exhausted"
 
 
-def _is_cascadable_error(err_str):
-    """True if error suggests trying another model would help (429 or 5xx)."""
-    return any(f"HTTP {c}" in err_str for c in ("429", "500", "502", "503", "504"))
 
 
 def _extract_text(res):
@@ -728,33 +739,29 @@ def _extract_text(res):
     return "".join(p.get("text", "") for p in parts).strip()
 
 
-# ---------- gemini (text translate) ----------
+# ---------- gemini (single-model text translate) ----------
 def gemini_translate(system_prompt, user_text):
+    """ONE call to Gemini 2.5 Flash. Returns text or '(gemini: ...)' error string."""
+    if not GEMINI_API_KEY:
+        return "(gemini: not configured)"
     body = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": user_text}]}],
         "generationConfig": {"temperature": 0.3},
     }
-    last_err = ""
-    for model in GEMINI_TEXT_MODELS:
-        ok, result = _gemini_post(model, body, HTTP_TIMEOUT)
-        if ok:
-            text = _extract_text(result)
-            if text:
-                return text
-            last_err = f"empty from {model}"
-            continue
-        last_err = result
-        if _is_cascadable_error(result):
-            print(f"[gemini text: {model} busy ({result[:500]}); trying next model]", flush=True)
-            continue
-        return f"(translate error: {result})"
-    return f"(translate error: all free models busy — {last_err[:120]})"
+    ok, result = _gemini_post(GEMINI_TEXT_MODEL, body, HTTP_TIMEOUT)
+    if ok:
+        text = _extract_text(result)
+        return text or "(gemini: empty response)"
+    return f"(gemini: {result[:200]})"
 
 
-# ---------- gemini (audio transcribe + translate, single call) ----------
+# ---------- gemini (single-model multimodal voice fallback) ----------
 def gemini_voice(audio_bytes, filename):
-    """Send Telugu audio to Gemini. Returns {telugu, english} or {error}."""
+    """ONE call to Gemini Flash multimodal. Returns {telugu, english} or {error}.
+    Used as fallback when Groq Whisper is unavailable."""
+    if not GEMINI_API_KEY:
+        return {"error": "gemini not configured"}
     mime = _audio_mime(filename)
     b64 = base64.b64encode(audio_bytes).decode("ascii")
     body = {
@@ -766,32 +773,157 @@ def gemini_voice(audio_bytes, filename):
         }],
         "generationConfig": {"temperature": 0.3},
     }
-    last_err = ""
-    for model in GEMINI_AUDIO_MODELS:
-        ok, result = _gemini_post(model, body, STT_TIMEOUT)
-        if ok:
-            text = _extract_text(result)
-            if not text:
-                last_err = f"empty from {model}"
-                continue
-            telugu, english = "", ""
-            for raw_line in text.splitlines():
-                # Strip markdown bold/italic wrappers, whitespace, leading bullets.
-                line = raw_line.strip().lstrip("*").lstrip("-").lstrip().rstrip("*").strip()
-                upper = line.upper()
-                if upper.startswith("TELUGU:"):
-                    telugu = line.split(":", 1)[1].strip() if ":" in line else ""
-                elif upper.startswith("ENGLISH:"):
-                    english = line.split(":", 1)[1].strip() if ":" in line else ""
-            if telugu or english:
-                return {"telugu": telugu, "english": english}
-            return {"telugu": "", "english": text}
-        last_err = result
-        if _is_cascadable_error(result):
-            print(f"[gemini audio: {model} busy ({result[:500]}); trying next model]", flush=True)
-            continue
+    ok, result = _gemini_post(GEMINI_AUDIO_MODEL, body, STT_TIMEOUT)
+    if not ok:
         return {"error": result}
-    return {"error": f"all models busy — {last_err[:120]}"}
+    text = _extract_text(result)
+    if not text:
+        return {"error": "empty response"}
+    telugu, english = "", ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("*").lstrip("-").lstrip().rstrip("*").strip()
+        upper = line.upper()
+        if upper.startswith("TELUGU:"):
+            telugu = line.split(":", 1)[1].strip() if ":" in line else ""
+        elif upper.startswith("ENGLISH:"):
+            english = line.split(":", 1)[1].strip() if ":" in line else ""
+    if telugu or english:
+        return {"telugu": telugu, "english": english}
+    return {"telugu": "", "english": text}
+
+
+# ---------- multipart helper (for Groq Whisper audio upload) ----------
+def _multipart_encode(fields, files):
+    """Build multipart/form-data body.
+    fields: dict of {name: str}. files: dict of {name: (filename, bytes, ctype)}."""
+    boundary = b"--FormBoundary" + secrets.token_hex(12).encode()
+    body = bytearray()
+    for name, value in fields.items():
+        body += b"--" + boundary + b"\r\n"
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += str(value).encode() + b"\r\n"
+    for name, (filename, data, ctype) in files.items():
+        body += b"--" + boundary + b"\r\n"
+        body += (
+            f'Content-Disposition: form-data; name="{name}"; '
+            f'filename="{filename}"\r\n'
+        ).encode()
+        body += f"Content-Type: {ctype}\r\n\r\n".encode()
+        body += data + b"\r\n"
+    body += b"--" + boundary + b"--\r\n"
+    return bytes(body), f"multipart/form-data; boundary={boundary.decode()}"
+
+
+# ---------- groq (chat — Llama 3.3 70B) ----------
+def groq_chat(system_prompt, user_text, max_retries=2):
+    """ONE call to Groq Llama 3.3 70B. Returns text or '(groq: ...)' error string."""
+    if not GROQ_API_KEY:
+        return "(groq: not configured)"
+    body_dict = {
+        "model": GROQ_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.3,
+    }
+    body_bytes = json.dumps(body_dict).encode()
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _http_request(GROQ_CHAT_URL, data=body_bytes, headers=headers, timeout=HTTP_TIMEOUT)
+            res = json.loads(raw)
+            text = res.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return text or "(groq: empty response)"
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}".replace("\n", " ")
+            if e.code == 429:
+                return f"(groq: {err})"
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[groq chat {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return f"(groq: {err})"
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(_retry_wait(attempt))
+                continue
+            return f"(groq: {e})"
+    return "(groq: retries exhausted)"
+
+
+# ---------- groq (Whisper Large v3) ----------
+def groq_transcribe(audio_bytes, filename, language="te", max_retries=1):
+    """Send Telugu audio to Groq Whisper. Returns {transcript} or {error}."""
+    if not GROQ_API_KEY:
+        return {"error": "groq not configured"}
+    ext = filename.lower().rsplit(".", 1)[-1]
+    ctype = {
+        "oga": "audio/ogg", "ogg": "audio/ogg", "opus": "audio/ogg",
+        "mp3": "audio/mpeg", "m4a": "audio/mp4",
+        "wav": "audio/wav", "flac": "audio/flac",
+    }.get(ext, "audio/ogg")
+    fields = {"model": GROQ_WHISPER_MODEL, "language": language, "response_format": "json"}
+    files = {"file": (filename, audio_bytes, ctype)}
+    body, content_type = _multipart_encode(fields, files)
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": content_type,
+    }
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _http_request(GROQ_AUDIO_URL, data=body, headers=headers, timeout=STT_TIMEOUT)
+            res = json.loads(raw)
+            return {"transcript": (res.get("text") or "").strip()}
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}".replace("\n", " ")
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[groq whisper {e.code}; retry in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return {"error": err}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "retries exhausted"}
+
+
+# ---------- unified entrypoints with SEQUENTIAL fallback ----------
+# These are the only callers used by handle_message. On success, only 1 API call.
+# Fallback (2nd call) runs only if the primary returned an error.
+
+def translate_text(system_prompt, user_text):
+    """Try Gemini 2.5 Flash first (best Telugu quality). On error, fall back to Groq Llama 3.3 70B."""
+    if GEMINI_API_KEY:
+        result = gemini_translate(system_prompt, user_text)
+        if not result.startswith("("):
+            return result
+        print(f"[text: gemini failed ({result[:80]}); trying groq]", flush=True)
+    if GROQ_API_KEY:
+        return groq_chat(system_prompt, user_text)
+    return "(no provider succeeded)"
+
+
+def transcribe_voice(audio_bytes, filename):
+    """Try Groq Whisper first (purpose-built STT). On error, fall back to Gemini multimodal.
+    Returns {telugu, english (optional), error (optional)}."""
+    if GROQ_API_KEY:
+        result = groq_transcribe(audio_bytes, filename, language="te")
+        if "transcript" in result and result["transcript"]:
+            return {"telugu": result["transcript"]}
+        print(f"[voice: groq whisper failed ({result.get('error', '?')[:80]}); trying gemini]", flush=True)
+    if GEMINI_API_KEY:
+        result = gemini_voice(audio_bytes, filename)
+        if "error" not in result:
+            return result
+        return {"error": result["error"]}
+    return {"error": "no provider succeeded"}
 
 
 # ---------- language detection ----------
@@ -877,26 +1009,30 @@ def handle_message(msg):
             release("voice")
             send_message(chat_id, "⚠️ Couldn't download the voice file.", reply_to=msg_id)
             return
-        result = gemini_voice(audio, filename)
-        if "error" in result:
+
+        # Step 1: transcribe (Groq Whisper → Gemini multimodal fallback)
+        trans = transcribe_voice(audio, filename)
+        if "error" in trans:
             release("voice")
-            err = result["error"]
-            if "all models busy" in err:
-                msg = (
-                    f"⚠️ Translation services are busy right now.\n"
-                    f"Please wait ~1 minute and send the voice again.\n"
-                    f"(If this keeps happening all day, daily limits reset at {_next_reset_ist()}.)"
-                )
-            else:
-                msg = "⚠️ Voice processing failed. Please try again."
-            send_message(chat_id, msg, reply_to=msg_id)
+            send_message(
+                chat_id,
+                "⚠️ Voice transcription failed on all providers. Please try again in a minute.",
+                reply_to=msg_id,
+            )
             return
-        te = result.get("telugu", "").strip()
-        en = result.get("english", "").strip()
+
+        te = trans.get("telugu", "").strip()
+        en = trans.get("english", "").strip()  # may already be set by Gemini multimodal fallback
+
+        # Step 2: if we have Telugu but no English yet, polish via text path
+        if te and not en:
+            polished = translate_text(TE_TO_EN_SYSTEM, te)
+            en = "" if polished.startswith("(") else polished
+
         reply = ""
         if te:
             reply += f"🎙 Telugu (heard):\n{te}\n\n"
-        reply += f"💬 English (copy-paste ready):\n{en or '(no translation)'}"
+        reply += f"💬 English (copy-paste ready):\n{en or '(translation failed — try again)'}"
         reply += f"\n\n{_status_line()}"
         reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
         _remember_feedback(reply_msg_id, {
@@ -922,25 +1058,22 @@ def handle_message(msg):
         return
 
     send_chat_action(chat_id, "typing")
-    if is_telugu(text):
-        out = gemini_translate(TE_TO_EN_SYSTEM, text)
-    else:
-        out = gemini_translate(EN_TO_TE_SYSTEM, text)
-    if out.startswith("(translate error"):
+    direction = "te2en" if is_telugu(text) else "en2te"
+    system_prompt = TE_TO_EN_SYSTEM if direction == "te2en" else EN_TO_TE_SYSTEM
+    out = translate_text(system_prompt, text)
+
+    # Error strings always start with "(" (e.g., "(gemini: ...)", "(groq: ...)", "(no provider...)").
+    # Translations never start with "(" because prompts forbid prefixes.
+    if out.startswith("("):
         release("text")
-        if "all free models busy" in out:
-            out = (
-                f"⚠️ Translation services are busy right now.\n"
-                f"Please wait ~1 minute and try again.\n"
-                f"(If this keeps happening all day, daily limits reset at {_next_reset_ist()}.)"
-            )
-        else:
-            out = "⚠️ Translation failed. Please try again."
-        send_message(chat_id, out, reply_to=msg_id)
+        send_message(
+            chat_id,
+            "⚠️ Translation failed on all providers. Please try again in a minute.",
+            reply_to=msg_id,
+        )
         return
 
     translated = out
-    direction = "te2en" if is_telugu(text) else "en2te"
     out += f"\n\n{_status_line()}"
     reply_msg_id = send_message(chat_id, out, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
     _remember_feedback(reply_msg_id, {

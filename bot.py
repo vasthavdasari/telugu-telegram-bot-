@@ -860,14 +860,24 @@ def groq_chat(system_prompt, user_text, max_retries=2):
 
 # ---------- groq (Whisper Large v3) ----------
 def groq_transcribe(audio_bytes, filename, language="te", max_retries=1):
-    """Send Telugu audio to Groq Whisper. Returns {transcript} or {error}."""
+    """Send Telugu audio to Groq Whisper. Returns {transcript} or {error}.
+
+    Groq's Whisper (OpenAI-compatible) validates by filename extension, accepting
+    only: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, webm. Telegram delivers voice
+    messages with .oga extension (valid OGG content, invalid name) — we rename it
+    to .ogg before upload so Groq accepts it.
+    """
     if not GROQ_API_KEY:
         return {"error": "groq not configured"}
     ext = filename.lower().rsplit(".", 1)[-1]
+    if ext in ("oga", "opus"):
+        base = filename.rsplit(".", 1)[0] if "." in filename else filename
+        filename = base + ".ogg"
+        ext = "ogg"
     ctype = {
-        "oga": "audio/ogg", "ogg": "audio/ogg", "opus": "audio/ogg",
-        "mp3": "audio/mpeg", "m4a": "audio/mp4",
-        "wav": "audio/wav", "flac": "audio/flac",
+        "ogg": "audio/ogg",
+        "mp3": "audio/mpeg", "m4a": "audio/mp4", "mp4": "audio/mp4",
+        "wav": "audio/wav", "flac": "audio/flac", "webm": "audio/webm",
     }.get(ext, "audio/ogg")
     fields = {"model": GROQ_WHISPER_MODEL, "language": language, "response_format": "json"}
     files = {"file": (filename, audio_bytes, ctype)}

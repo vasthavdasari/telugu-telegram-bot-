@@ -178,6 +178,16 @@ RULES:
 - Never translate proper nouns, brand names, product names (iPhone, PS5, Nikon, etc.), model numbers, dollar amounts, or URLs.
 - Keep length and register similar to the English input.
 
+EMOTIONAL TONE — carry the SAME emotion from English into Telugu, don't flatten it:
+- Polite/friendly seller ("Sure thing!", "Happy to help", "of course") → use cheerful Telugu: "తప్పకుండా", "సంతోషంగా", exclamation, ishtamga
+- Firm/dismissive ("Price is firm", "no negotiations", "final") → keep it firm: "price fix", "negotiations ledu", short sentences
+- Apologetic ("really sorry", "my apologies") → reflect apology: "really sorry", "క్షమించండి", "nijanga sorry"
+- Frustrated/annoyed ("Already told you", "I said no") → reflect their annoyance: "already cheppanu kada", "ippatike cheppanu"
+- Enthusiastic ("Awesome!", "Great choice!") → use "!", "super", "awesome", match energy
+- Neutral/business-like → standard casual Telugu, no extra emotion
+
+The Telugu output MUST carry the SAME emotion as the English seller's message. The user reading it should feel the same vibe the seller intended.
+
 EXAMPLES (English eBay seller reply → casual Telugu):
 English: "Hi, yes the item is still available."
 Telugu:  హాయ్, అవును item ఇంకా available గా ఉంది.
@@ -201,7 +211,27 @@ English: "No returns on this item, sold as-is."
 Telugu:  ee item ki returns ledu, as-is sold.
 
 English: "Would you accept $180 shipped?"
-Telugu:  shipping kalipi 180 dollars ki accept chestava?"""
+Telugu:  shipping kalipi 180 dollars ki accept chestava?
+
+EXAMPLES showing TONE preservation from English seller:
+
+Firm: "Price is firm, no negotiations."
+Telugu:  Price fix, negotiations ledu.
+
+Friendly: "Sure thing! Happy to answer any questions."
+Telugu:  తప్పకుండా! ఏ doubts unna ishtamga cheptanu.
+
+Apologetic: "I'm really sorry for the delay, will ship today."
+Telugu:  Delay ki really sorry, ivaala ship chestanu.
+
+Dismissive: "Already told you, no returns."
+Telugu:  Already cheppanu kada, returns ledu.
+
+Enthusiastic: "Awesome! Great choice, you'll love it!"
+Telugu:  Super! Choice బాగుంది, meeku chala nachutundi!
+
+Frustrated: "I said no returns. Don't ask again."
+Telugu:  Returns ledu ani cheppanu kada. Malli adagaku."""
 
 TE_TO_EN_SYSTEM = """You translate Telugu to English. The input may be in Telugu script (తెలుగు) OR in Tinglish (Telugu typed with Roman/English letters, e.g. "naaku e camera entha price ki istharu", "ela undi", "cheppandi"). Treat both as Telugu and translate to English. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, placing/confirming orders. Your output will be pasted directly into an eBay message box.
 
@@ -232,6 +262,19 @@ delve, leverage, navigate, journey, realm, tapestry, landscape, foster, harness,
 embark, unlock potential, in the realm of, it's worth noting, it's important to note,
 moreover, furthermore, nevertheless, hence, thus, crucial, pivotal, seamless, robust.
 
+EMOTIONAL TONE — carry the SAME emotion, don't flatten it:
+Before translating, identify the tone. Telugu tonal cues and their English equivalents:
+- Polite/respectful (andi, garu, dayachesi, please, softeners) → "could you please", "would you mind", "I'd really appreciate", "thank you so much"
+- Pleading (repeated asks, "chala kavali naaku", emotional emphasis) → "would really mean a lot", "I'd love to", "please, I'd really appreciate"
+- Urgent (twaraga, urgent, exclamations, "vendi vendi") → "ASAP", "really need this soon", exclamation marks
+- Firm/assertive (short, direct, no softeners, "final", "take it or leave it") → crisp, no fluff: "I'll take it for $X", "final offer"
+- Casual/neutral (standard phrasing) → everyday natural English
+- Friendly/curious ("anukuntunna", light chatty tone) → "just wondering", "curious about", "hey so..."
+- Frustrated/annoyed (sharp, "ento idi", complaining markers) → firm disappointment: "this isn't what I expected", "can you explain why..."
+- Happy/excited (exclamations, "wow", "super", enthusiasm markers) → use "!", "awesome", "love it", "sounds great"
+
+The English output MUST carry the SAME emotion as the Telugu. A polite request stays polite. A firm demand stays firm. An excited message stays excited. Never neutralize.
+
 EXAMPLES (Telugu → natural English for eBay):
 "hello e camera naaku entha price ki istharu"
 → Hey, how much are you selling this camera for?
@@ -261,7 +304,33 @@ EXAMPLES (Telugu → natural English for eBay):
 → What's your return policy?
 
 "thanks, confirm chesi order chestha"
-→ Thanks, I'll confirm and place the order."""
+→ Thanks, I'll confirm and place the order.
+
+EXAMPLES showing TONE preservation (same topic, different emotion):
+
+Polite: "please cheppandi e camera condition ela undi, naaku chala interested ga undi"
+→ Could you please let me know the condition of this camera? I'm really interested in it.
+
+Neutral: "camera condition ela undi"
+→ What's the condition of this camera?
+
+Firm: "final offer 200 dollars, take it or leave it"
+→ Final offer: $200. Take it or leave it.
+
+Pleading: "please please 150 ki ivvandi, chala important naaku"
+→ Please, would you consider $150? It would really mean a lot to me.
+
+Urgent: "urgent ga reply cheyyi, repu ship avvali eesari"
+→ Please reply ASAP — I really need this shipped by tomorrow!
+
+Friendly/curious: "hey just anukuntunna, ee model kothadhi a"
+→ Hey, just curious — is this a newer model?
+
+Frustrated: "ento ee delay, 5 rojulu ayindi inka ship cheyyaledu"
+→ What's with the delay? It's been 5 days and still not shipped.
+
+Excited: "wow super deal, definitely kontha, thanks"
+→ Wow, great deal — I'll definitely take it, thanks!"""
 
 VOICE_PROMPT = """The audio is a voice message spoken in Telugu. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, confirming orders. The English output will be pasted directly into an eBay message box.
 
@@ -288,6 +357,18 @@ eBay-buyer register patterns:
 - Box/accessories → "does it come with the original box?", "are accessories included?"
 - Closing → "thanks!", "appreciate it!"
 
+EMOTIONAL TONE — carry the SAME emotion, never flatten it:
+- Polite (andi, garu, dayachesi, please) → "could you please", "would you mind", "I'd appreciate"
+- Pleading (repeated asks, emotional emphasis) → "would really mean a lot", "please, I'd love"
+- Urgent (twaraga, exclamations) → "ASAP", "really need this soon", "!"
+- Firm (short, direct, final) → crisp: "Final offer: $X", "Take it or leave it"
+- Casual (standard) → everyday natural English
+- Friendly/curious (anukuntunna, chatty) → "just wondering", "curious about"
+- Frustrated (sharp complaining) → firm: "what's going on with...", "this isn't what I expected"
+- Excited (wow, enthusiasm) → "!", "love this", "sounds great"
+
+The English MUST carry the SAME emotion as the Telugu. Polite stays polite. Firm stays firm. Excited stays excited.
+
 EXAMPLES:
 Telugu: "hello e camera naaku entha price ki istharu"
 English: Hey, how much are you selling this camera for?
@@ -306,6 +387,23 @@ English: Does it come with the original box and all the accessories?
 
 Telugu: "200 dollars ki ichhestava, best offer"
 English: Would you take $200 as a best offer?
+
+EXAMPLES showing TONE preservation:
+
+Polite: "please cheppandi, camera condition chala important naaku"
+English: Could you please let me know the condition? It's really important to me.
+
+Firm: "final offer 200 dollars, take it or leave it"
+English: Final offer: $200. Take it or leave it.
+
+Urgent: "urgent ga reply cheyyi, repu ship avvali"
+English: Please reply ASAP — I really need this shipped by tomorrow!
+
+Frustrated: "ento idi, 5 rojulu ayyindi inka ship cheyyaledu"
+English: What's going on? It's been 5 days and still not shipped.
+
+Excited: "super deal, definitely kontha, thanks"
+English: Great deal — I'll definitely take it, thanks!
 
 Return your response in THIS EXACT format, with these two lines and nothing else:
 TELUGU: <the Telugu transcript>

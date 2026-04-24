@@ -8,16 +8,19 @@ What it does
     - Telugu voice message -> Telugu transcript + polished English
 
 Providers (sequential fallback — only 1 API call per message on success)
-    Text translation (3-tier cascade):
-        1. Gemini 2.5 Flash     PRIMARY  (best Telugu — academic studies confirm)
-        2. Gemma 4 31B (OpenRouter free)  FALLBACK 1 (Gemini-3 arch, 140+ langs)
-        3. Groq Llama 3.3 70B   FALLBACK 2 (last resort — Telugu not in Meta's list)
-    Voice transcription (2-tier cascade):
-        1. Groq Whisper Large v3       PRIMARY  (dedicated ASR, ~10% WER Telugu)
-        2. Gemini 2.5 Flash multimodal FALLBACK (less WER precision)
+    Text cascade:
+        1. Sarvam 105B             PRIMARY   (Indian-language LLM, FREE on Sarvam)
+        2. Gemini 2.5 Flash        FALLBACK 1 (Google, general-purpose Telugu)
+        3. Gemma 4 31B (OpenRouter free)  FALLBACK 2 (Gemini-3 architecture)
+        4. Groq Llama 3.3 70B      FALLBACK 3 (last resort)
+    Voice cascade:
+        1. Sarvam Saaras v3        PRIMARY   (Indian-language STT)
+        2. Gemini 2.5 Flash multimodal  FALLBACK 1
+        3. Groq Whisper Large v3   FALLBACK 2
 
 Required environment variables
     TELEGRAM_BOT_TOKEN   from @BotFather
+    SARVAM_API_KEY       (optional) from dashboard.sarvam.ai
     GEMINI_API_KEY       (optional) from aistudio.google.com/apikey
     OPENROUTER_API_KEY   (optional) from openrouter.ai/settings/keys
     GROQ_API_KEY         (optional) from console.groq.com
@@ -53,23 +56,34 @@ def _require_env(name):
 
 
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 
-if not (GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY):
+if not (SARVAM_API_KEY or GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY):
     print("ERROR: at least one LLM API key must be set.", flush=True)
     sys.exit(1)
 
-# Provider priority — SEQUENTIAL fallback, never parallel:
-#   Text:  Gemini 2.5 Flash (primary — best Telugu quality per research)
-#       -> Gemma 4 31B via OpenRouter (fallback 1 — Gemini-3 architecture, 140+ lang)
-#       -> Groq Llama 3.3 70B (last resort — Telugu not in Meta's supported list)
-#   Voice: Groq Whisper Large v3 (primary — purpose-built ASR, ~10% WER Telugu)
-#       -> Gemini 2.5 Flash multimodal (fallback — general model, less WER precision)
-# If the primary succeeds, only 1 API call per user message. Each fallback only
-# runs when the prior provider returned an error.
+# Provider priority — SEQUENTIAL fallback, never parallel.
+# Sarvam is primary because it's purpose-built for Indian languages.
+#
+#   Text cascade:
+#     1) Sarvam 105B        (Sarvam-105B chat, FREE, best Indian-language LLM)
+#     2) Gemini 2.5 Flash   (Google, general-purpose best Telugu)
+#     3) Gemma 4 31B        (OpenRouter free, Gemini-3 architecture)
+#     4) Llama 3.3 70B      (Groq, last resort)
+#
+#   Voice cascade:
+#     1) Sarvam Saaras v3   (Sarvam STT, purpose-built for Indian languages)
+#     2) Groq Whisper v3    (general ASR fallback)
+#     3) Gemini multimodal  (last resort)
+#
+# On success, only 1 API call per user message. Each fallback only runs
+# when the prior provider returned an error.
+SARVAM_CHAT_MODEL = "sarvam-105b"
+SARVAM_STT_MODEL = "saaras:v3"
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
 GEMINI_AUDIO_MODEL = "gemini-2.5-flash"
 OPENROUTER_CHAT_MODEL = "google/gemma-4-31b-it:free"
@@ -82,6 +96,8 @@ TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 GEMINI_URL_TMPL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
+SARVAM_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -95,104 +111,13 @@ POLL_TIMEOUT = 30
 HTTP_TIMEOUT = 90
 STT_TIMEOUT = 120
 
-# Transient HTTP errors we silently retry on (Gemini occasionally returns
-# 503 on free tier when servers are busy; 5xx/429 are all retryable).
+# Transient HTTP errors we silently retry on (occasional 503 / 5xx).
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
 
 def _retry_wait(attempt):
     """Exponential backoff: 5, 10, 20, 40, 80 seconds (capped at 90)."""
     return min(5.0 * (2 ** attempt), 90.0)
-
-# Daily hard caps (resets midnight Pacific).
-# Text: matches Gemini Flash-Lite's free tier cap (1000/day).
-# Voice: kept well under GCP's 1GB/month egress — 50/day × 200KB × 30d ~= 300 MB.
-TEXT_DAILY_LIMIT = 1000
-VOICE_DAILY_LIMIT = 50
-
-USAGE_FILE = os.environ.get("USAGE_FILE", "usage.json")
-_usage_lock = threading.Lock()
-
-
-def _pacific_today():
-    """Today's date in Pacific time (where Gemini's daily quota resets)."""
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
-    except Exception:
-        # Fallback: UTC-7 (approximates Pacific without DST awareness).
-        return datetime.now(timezone(timedelta(hours=-7))).strftime("%Y-%m-%d")
-
-
-def _next_reset_ist():
-    """Return the next quota reset time as a short IST string, e.g. '12:30 PM IST'."""
-    try:
-        from zoneinfo import ZoneInfo
-        pt_now = datetime.now(ZoneInfo("America/Los_Angeles"))
-        pt_midnight = (pt_now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        ist = pt_midnight.astimezone(ZoneInfo("Asia/Kolkata"))
-        h = ist.hour % 12 or 12
-        return f"{h}:{ist.minute:02d} {'AM' if ist.hour < 12 else 'PM'} IST"
-    except Exception:
-        return "midnight Pacific"
-
-
-def _status_line():
-    """One-line summary of remaining quota + reset time, appended to replies."""
-    with _usage_lock:
-        d = _load_usage()
-    text_left = max(0, TEXT_DAILY_LIMIT - d.get("text", 0))
-    voice_left = max(0, VOICE_DAILY_LIMIT - d.get("voice", 0))
-    return (
-        f"📊 Text: {text_left}/{TEXT_DAILY_LIMIT} · "
-        f"Voice: {voice_left}/{VOICE_DAILY_LIMIT} · "
-        f"Resets {_next_reset_ist()}"
-    )
-
-
-def _load_usage():
-    try:
-        with open(USAGE_FILE) as f:
-            d = json.load(f)
-    except Exception:
-        d = {}
-    if d.get("date") != _pacific_today():
-        d = {"date": _pacific_today(), "text": 0, "voice": 0}
-    return d
-
-
-def _save_usage(d):
-    try:
-        with open(USAGE_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception as e:
-        print(f"[usage save failed: {e}]", flush=True)
-
-
-def try_reserve(kind):
-    """Atomically reserve one slot for 'text' or 'voice'.
-
-    Returns remaining count after this reservation, or None if we're
-    already at the daily cap (hard block, no API call should be made).
-    """
-    limit = TEXT_DAILY_LIMIT if kind == "text" else VOICE_DAILY_LIMIT
-    with _usage_lock:
-        d = _load_usage()
-        if d.get(kind, 0) >= limit:
-            return None
-        d[kind] = d.get(kind, 0) + 1
-        _save_usage(d)
-        return max(0, limit - d[kind])
-
-
-def release(kind):
-    """Refund one slot (call when an API request errors out)."""
-    with _usage_lock:
-        d = _load_usage()
-        d[kind] = max(0, d.get(kind, 0) - 1)
-        _save_usage(d)
 
 
 # ---------- prompts ----------
@@ -928,6 +853,86 @@ def groq_transcribe(audio_bytes, filename, language="te", max_retries=1):
     return {"error": "retries exhausted"}
 
 
+# ---------- sarvam (chat — Sarvam-105B free) ----------
+def sarvam_translate(system_prompt, user_text, max_retries=2):
+    """ONE call to Sarvam-105B. Returns text or '(sarvam: ...)' error string."""
+    if not SARVAM_API_KEY:
+        return "(sarvam: not configured)"
+    body_dict = {
+        "model": SARVAM_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.3,
+    }
+    body_bytes = json.dumps(body_dict).encode()
+    headers = {
+        "Authorization": f"Bearer {SARVAM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _http_request(SARVAM_CHAT_URL, data=body_bytes, headers=headers, timeout=HTTP_TIMEOUT)
+            res = json.loads(raw)
+            text = res.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return text or "(sarvam: empty response)"
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}".replace("\n", " ")
+            if e.code == 429:
+                return f"(sarvam: {err})"
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[sarvam chat {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return f"(sarvam: {err})"
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(_retry_wait(attempt))
+                continue
+            return f"(sarvam: {e})"
+    return "(sarvam: retries exhausted)"
+
+
+# ---------- sarvam (Saaras v3 speech-to-text) ----------
+def sarvam_transcribe(audio_bytes, filename, language="te-IN", max_retries=1):
+    """Send Telugu audio to Sarvam Saaras v3. Returns {transcript} or {error}."""
+    if not SARVAM_API_KEY:
+        return {"error": "sarvam not configured"}
+    ext = filename.lower().rsplit(".", 1)[-1]
+    ctype = {
+        "oga": "audio/ogg", "ogg": "audio/ogg", "opus": "audio/ogg",
+        "mp3": "audio/mpeg", "m4a": "audio/mp4",
+        "wav": "audio/wav", "flac": "audio/flac", "webm": "audio/webm",
+    }.get(ext, "audio/ogg")
+    fields = {"model": SARVAM_STT_MODEL, "language_code": language}
+    files = {"file": (filename, audio_bytes, ctype)}
+    body, content_type = _multipart_encode(fields, files)
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": content_type,
+    }
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _http_request(SARVAM_STT_URL, data=body, headers=headers, timeout=STT_TIMEOUT)
+            res = json.loads(raw)
+            return {"transcript": (res.get("transcript") or "").strip()}
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}".replace("\n", " ")
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[sarvam stt {e.code}; retry in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return {"error": err}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "retries exhausted"}
+
+
 # ---------- openrouter (chat — Gemma 4 31B free tier) ----------
 def openrouter_chat(system_prompt, user_text, max_retries=2):
     """ONE call to OpenRouter Gemma 4 31B (free tier, 200 RPD).
@@ -979,46 +984,55 @@ def openrouter_chat(system_prompt, user_text, max_retries=2):
 # Each fallback runs only if the prior provider returned an error.
 
 def translate_text(system_prompt, user_text):
-    """3-tier sequential cascade for text translation:
-       1) Gemini 2.5 Flash  (best Telugu per academic research)
-       2) OpenRouter Gemma 4 31B  (Gemini-3 architecture, 140+ langs)
-       3) Groq Llama 3.3 70B  (last resort — Telugu not in Meta's official list)
+    """4-tier sequential cascade for text translation.
+    Returns {"text": str, "model": str} on success, {"error": str} on all-fail.
+
+    Order: Sarvam 105B → Gemini 2.5 Flash → OpenRouter Gemma 4 31B → Groq Llama 3.3 70B.
     """
+    cascade = [
+        ("sarvam-105b", SARVAM_API_KEY, sarvam_translate),
+        ("gemini-2.5-flash", GEMINI_API_KEY, gemini_translate),
+        ("gemma-4-31b (openrouter)", OPENROUTER_API_KEY, openrouter_chat),
+        ("llama-3.3-70b (groq)", GROQ_API_KEY, groq_chat),
+    ]
     tried = []
-    if GEMINI_API_KEY:
-        result = gemini_translate(system_prompt, user_text)
+    for model_name, key, call in cascade:
+        if not key:
+            continue
+        result = call(system_prompt, user_text)
         if not result.startswith("("):
-            return result
-        tried.append(f"gemini({result[:60]})")
-        print(f"[text: gemini failed ({result[:80]}); trying openrouter]", flush=True)
-    if OPENROUTER_API_KEY:
-        result = openrouter_chat(system_prompt, user_text)
-        if not result.startswith("("):
-            return result
-        tried.append(f"openrouter({result[:60]})")
-        print(f"[text: openrouter failed ({result[:80]}); trying groq]", flush=True)
-    if GROQ_API_KEY:
-        result = groq_chat(system_prompt, user_text)
-        if not result.startswith("("):
-            return result
-        tried.append(f"groq({result[:60]})")
-    return f"(all providers failed: {'; '.join(tried)[:250]})"
+            return {"text": result, "model": model_name}
+        tried.append(f"{model_name}")
+        print(f"[text: {model_name} failed ({result[:80]}); trying next]", flush=True)
+    return {"error": f"all providers failed (tried: {', '.join(tried) or 'none'})"}
 
 
 def transcribe_voice(audio_bytes, filename):
-    """Try Groq Whisper first (purpose-built STT). On error, fall back to Gemini multimodal.
-    Returns {telugu, english (optional), error (optional)}."""
-    if GROQ_API_KEY:
-        result = groq_transcribe(audio_bytes, filename, language="te")
+    """3-tier cascade for voice transcription.
+    Returns {"telugu": str, "english": optional, "transcribe_model": str} on success,
+    or {"error": str} on all-fail.
+
+    Order: Sarvam Saaras v3 → Gemini 2.5 Flash multimodal → Groq Whisper Large v3.
+    """
+    if SARVAM_API_KEY:
+        result = sarvam_transcribe(audio_bytes, filename, language="te-IN")
         if "transcript" in result and result["transcript"]:
-            return {"telugu": result["transcript"]}
-        print(f"[voice: groq whisper failed ({result.get('error', '?')[:80]}); trying gemini]", flush=True)
+            return {"telugu": result["transcript"], "transcribe_model": "sarvam-saaras-v3"}
+        print(f"[voice: sarvam failed ({result.get('error', '?')[:80]}); trying gemini]", flush=True)
     if GEMINI_API_KEY:
         result = gemini_voice(audio_bytes, filename)
         if "error" not in result:
-            return result
-        return {"error": result["error"]}
-    return {"error": "no provider succeeded"}
+            return {
+                "telugu": result.get("telugu", ""),
+                "english": result.get("english", ""),
+                "transcribe_model": "gemini-2.5-flash-multimodal",
+            }
+        print(f"[voice: gemini failed ({result.get('error', '?')[:80]}); trying groq whisper]", flush=True)
+    if GROQ_API_KEY:
+        result = groq_transcribe(audio_bytes, filename, language="te")
+        if "transcript" in result and result["transcript"]:
+            return {"telugu": result["transcript"], "transcribe_model": "groq-whisper-v3"}
+    return {"error": "all providers failed"}
 
 
 # ---------- language detection ----------
@@ -1088,53 +1102,54 @@ def handle_message(msg):
 
     voice = msg.get("voice") or msg.get("audio")
     if voice:
-        reserved = try_reserve("voice")
-        if reserved is None:
-            send_message(
-                chat_id,
-                f"🛑 Daily voice limit reached ({VOICE_DAILY_LIMIT}/day).\n"
-                f"Resets at {_next_reset_ist()}.\n"
-                f"Text translation still works.",
-                reply_to=msg_id,
-            )
-            return
         send_chat_action(chat_id, "typing")
         filename, audio = download_voice(voice["file_id"])
         if not audio:
-            release("voice")
             send_message(chat_id, "⚠️ Couldn't download the voice file.", reply_to=msg_id)
             return
 
-        # Step 1: transcribe (Groq Whisper → Gemini multimodal fallback)
+        # Step 1: transcribe (Sarvam → Gemini → Groq Whisper)
         trans = transcribe_voice(audio, filename)
         if "error" in trans:
-            release("voice")
             send_message(
                 chat_id,
-                "⚠️ Voice transcription failed on all providers. Please try again in a minute.",
+                "⚠️ Voice transcription failed on all providers. Please try again.",
                 reply_to=msg_id,
             )
             return
 
         te = trans.get("telugu", "").strip()
-        en = trans.get("english", "").strip()  # may already be set by Gemini multimodal fallback
+        en = trans.get("english", "").strip()  # may be pre-filled by Gemini multimodal
+        transcribe_model = trans.get("transcribe_model", "?")
+        polish_model = ""
 
         # Step 2: if we have Telugu but no English yet, polish via text path
         if te and not en:
-            polished = translate_text(TE_TO_EN_SYSTEM, te)
-            en = "" if polished.startswith("(") else polished
+            polish_result = translate_text(TE_TO_EN_SYSTEM, te)
+            if "text" in polish_result:
+                en = polish_result["text"]
+                polish_model = polish_result["model"]
+            else:
+                polish_model = "failed"
 
         reply = ""
         if te:
             reply += f"🎙 Telugu (heard):\n{te}\n\n"
         reply += f"💬 English (copy-paste ready):\n{en or '(translation failed — try again)'}"
-        reply += f"\n\n{_status_line()}"
+        model_line = f"🤖 {transcribe_model}"
+        if polish_model and polish_model != "failed":
+            model_line += f" + {polish_model}"
+        elif polish_model == "failed":
+            model_line += " (polish failed)"
+        reply += f"\n\n{model_line}"
         reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
         _remember_feedback(reply_msg_id, {
             "direction": "voice_te2en",
             "input_audio_filename": filename,
             "telugu_transcript": te,
             "english": en,
+            "transcribe_model": transcribe_model,
+            "polish_model": polish_model,
         })
         return
 
@@ -1142,25 +1157,12 @@ def handle_message(msg):
         send_message(chat_id, "Send me English text, Telugu text, or a Telugu voice note.")
         return
 
-    reserved = try_reserve("text")
-    if reserved is None:
-        send_message(
-            chat_id,
-            f"🛑 Daily text limit reached ({TEXT_DAILY_LIMIT}/day).\n"
-            f"Resets at {_next_reset_ist()}.",
-            reply_to=msg_id,
-        )
-        return
-
     send_chat_action(chat_id, "typing")
     direction = "te2en" if is_telugu(text) else "en2te"
     system_prompt = TE_TO_EN_SYSTEM if direction == "te2en" else EN_TO_TE_SYSTEM
-    out = translate_text(system_prompt, text)
+    result = translate_text(system_prompt, text)
 
-    # Error strings always start with "(" (e.g., "(gemini: ...)", "(groq: ...)", "(no provider...)").
-    # Translations never start with "(" because prompts forbid prefixes.
-    if out.startswith("("):
-        release("text")
+    if "error" in result:
         send_message(
             chat_id,
             "⚠️ Translation failed on all providers. Please try again in a minute.",
@@ -1168,13 +1170,15 @@ def handle_message(msg):
         )
         return
 
-    translated = out
-    out += f"\n\n{_status_line()}"
-    reply_msg_id = send_message(chat_id, out, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
+    translated = result["text"]
+    model_label = result["model"]
+    reply = f"{translated}\n\n🤖 {model_label}"
+    reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
     _remember_feedback(reply_msg_id, {
         "direction": direction,
         "input": text,
         "output": translated,
+        "model": model_label,
     })
 
 

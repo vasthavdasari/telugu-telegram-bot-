@@ -233,7 +233,9 @@ ALWAYS keep these words in English (Latin letters) when they appear in the input
   Courtesy:      hello, hi, bye, please, sorry, thanks, thank you, ok, okay, welcome, yes, no
   Commerce:      price, cost, shipping, delivery, payment, order, refund, return, discount, offer,
                  item, brand, model, box, case, condition, original, genuine, used, new, available,
-                 free, cash, card, online, store, market, deal, quality, quantity, stock
+                 free, cash, card, online, store, market, deal, quality, quantity, stock,
+                 listing, bill, invoice, receipt, warranty, guarantee, ad, advertisement,
+                 description, seller, buyer, account, transaction, feedback, rating, review
   Money:         dollar, dollars, rupees, USD, INR, amount, total
   Tech/Comms:    phone, mobile, laptop, computer, internet, email, WhatsApp, message, website,
                  link, app, notification, password, OTP, login, video, photo, screenshot, file
@@ -299,6 +301,18 @@ Telugu:  మనం మునుపు మాట్లాడిన price negotiat
 
 English: "How's life?"
 Telugu:  Life ఎలా ఉంది?
+
+English: "Is this listing still available?"
+Telugu:  ఈ listing ఇంకా available గా ఉందా?
+
+English: "Does it come with a bill?"
+Telugu:  Bill కూడా ఇస్తారా?
+
+English: "Can I get a warranty on this?"
+Telugu:  దీని మీద warranty ఇస్తారా?
+
+English: "What's the seller's rating?"
+Telugu:  Seller rating ఎంత ఉంది?
 
 EXAMPLES showing TONE preservation from English seller:
 

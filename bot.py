@@ -1043,9 +1043,18 @@ def openrouter_chat(system_prompt, user_text, max_retries=2):
 # These are the only callers used by handle_message. On success, only 1 API call.
 # Each fallback runs only if the prior provider returned an error.
 
-def translate_text(system_prompt, user_text):
+def _has_telugu_script(text):
+    return any("ఀ" <= c <= "౿" for c in text)
+
+
+def translate_text(system_prompt, user_text, target_lang=None):
     """4-tier sequential cascade for text translation.
     Returns {"text": str, "model": str} on success, {"error": str} on all-fail.
+
+    target_lang (optional): 'te' to require Telugu script output, 'en' to require
+    no Telugu script. If a provider returns output in the wrong language (e.g.
+    Sarvam echoing Telugu when English was requested), we treat it as a failure
+    and cascade to the next provider.
 
     Order: Sarvam 105B → Gemini 2.5 Flash → OpenRouter Gemma 4 31B → Groq Llama 3.3 70B.
     """
@@ -1060,10 +1069,29 @@ def translate_text(system_prompt, user_text):
         if not key:
             continue
         result = call(system_prompt, user_text)
-        if not result.startswith("("):
-            return {"text": result, "model": model_name}
-        tried.append(f"{model_name}")
-        print(f"[text: {model_name} failed ({result[:80]}); trying next]", flush=True)
+        if result.startswith("("):
+            tried.append(model_name)
+            print(f"[text: {model_name} errored ({result[:80]}); trying next]", flush=True)
+            continue
+        # Validate output language matches the requested target direction.
+        has_te = _has_telugu_script(result)
+        if target_lang == "en" and has_te:
+            tried.append(f"{model_name}(returned-telugu)")
+            print(
+                f"[text: {model_name} returned Telugu when English was expected; "
+                f"trying next]",
+                flush=True,
+            )
+            continue
+        if target_lang == "te" and not has_te:
+            tried.append(f"{model_name}(returned-english)")
+            print(
+                f"[text: {model_name} returned English when Telugu was expected; "
+                f"trying next]",
+                flush=True,
+            )
+            continue
+        return {"text": result, "model": model_name}
     return {"error": f"all providers failed (tried: {', '.join(tried) or 'none'})"}
 
 
@@ -1184,9 +1212,10 @@ def handle_message(msg):
         transcribe_model = trans.get("transcribe_model", "?")
         polish_model = ""
 
-        # Step 2: if we have Telugu but no English yet, polish via text path
+        # Step 2: if we have Telugu but no English yet, polish via text path.
+        # target_lang="en" ensures we fall through any provider that echoes Telugu.
         if te and not en:
-            polish_result = translate_text(TE_TO_EN_SYSTEM, te)
+            polish_result = translate_text(TE_TO_EN_SYSTEM, te, target_lang="en")
             if "text" in polish_result:
                 en = polish_result["text"]
                 polish_model = polish_result["model"]
@@ -1223,7 +1252,8 @@ def handle_message(msg):
     send_chat_action(chat_id, "typing")
     direction = "te2en" if is_telugu(text) else "en2te"
     system_prompt = TE_TO_EN_SYSTEM if direction == "te2en" else EN_TO_TE_SYSTEM
-    result = translate_text(system_prompt, text)
+    target = "en" if direction == "te2en" else "te"
+    result = translate_text(system_prompt, text, target_lang=target)
 
     if "error" in result:
         send_message(

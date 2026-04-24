@@ -1,0 +1,2 @@
+# No external dependencies — uses Python standard library only.
+# Included so hosting platforms (Pella, Railway, Render) recognize this as a Python project.

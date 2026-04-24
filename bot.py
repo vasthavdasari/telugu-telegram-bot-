@@ -8,19 +8,22 @@ What it does
     - Telugu voice message -> Telugu transcript + polished English
 
 Providers (sequential fallback — only 1 API call per message on success)
-    - Telegram Bot API       unlimited, personal use, free
-    - Gemini 2.5 Flash       PRIMARY for text translation (best Telugu quality)
-    - Groq Llama 3.3 70B     FALLBACK for text if Gemini fails (1000 req/day)
-    - Groq Whisper Large v3  PRIMARY for voice transcription (2000 req/day)
-    - Gemini 2.5 multimodal  FALLBACK for voice if Groq Whisper fails
+    Text translation (3-tier cascade):
+        1. Gemini 2.5 Flash     PRIMARY  (best Telugu — academic studies confirm)
+        2. Gemma 4 31B (OpenRouter free)  FALLBACK 1 (Gemini-3 arch, 140+ langs)
+        3. Groq Llama 3.3 70B   FALLBACK 2 (last resort — Telugu not in Meta's list)
+    Voice transcription (2-tier cascade):
+        1. Groq Whisper Large v3       PRIMARY  (dedicated ASR, ~10% WER Telugu)
+        2. Gemini 2.5 Flash multimodal FALLBACK (less WER precision)
 
 Required environment variables
     TELEGRAM_BOT_TOKEN   from @BotFather
     GEMINI_API_KEY       (optional) from aistudio.google.com/apikey
+    OPENROUTER_API_KEY   (optional) from openrouter.ai/settings/keys
     GROQ_API_KEY         (optional) from console.groq.com
     PORT                 optional; defaults to 8080 (health endpoint)
 
-    At least one of GEMINI_API_KEY or GROQ_API_KEY must be set.
+    At least one LLM key must be set.
 
 Stdlib only. No pip install needed.
 """
@@ -52,19 +55,24 @@ def _require_env(name):
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", "8080"))
 
-if not (GEMINI_API_KEY or GROQ_API_KEY):
-    print("ERROR: at least one of GEMINI_API_KEY or GROQ_API_KEY must be set.", flush=True)
+if not (GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY):
+    print("ERROR: at least one LLM API key must be set.", flush=True)
     sys.exit(1)
 
 # Provider priority — SEQUENTIAL fallback, never parallel:
-#   Text:  Gemini 2.5 Flash (quality) -> Groq Llama 3.3 70B (capacity)
-#   Voice: Groq Whisper Large v3 (purpose-built) -> Gemini 2.5 Flash multimodal (fallback)
-# If the primary succeeds, only 1 API call per user message. Fallback only runs
-# when the primary raises an error.
+#   Text:  Gemini 2.5 Flash (primary — best Telugu quality per research)
+#       -> Gemma 4 31B via OpenRouter (fallback 1 — Gemini-3 architecture, 140+ lang)
+#       -> Groq Llama 3.3 70B (last resort — Telugu not in Meta's supported list)
+#   Voice: Groq Whisper Large v3 (primary — purpose-built ASR, ~10% WER Telugu)
+#       -> Gemini 2.5 Flash multimodal (fallback — general model, less WER precision)
+# If the primary succeeds, only 1 API call per user message. Each fallback only
+# runs when the prior provider returned an error.
 GEMINI_TEXT_MODEL = "gemini-2.5-flash"
 GEMINI_AUDIO_MODEL = "gemini-2.5-flash"
+OPENROUTER_CHAT_MODEL = "google/gemma-4-31b-it:free"
 GROQ_CHAT_MODEL = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 
@@ -74,6 +82,7 @@ TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 GEMINI_URL_TMPL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 
@@ -919,20 +928,81 @@ def groq_transcribe(audio_bytes, filename, language="te", max_retries=1):
     return {"error": "retries exhausted"}
 
 
+# ---------- openrouter (chat — Gemma 4 31B free tier) ----------
+def openrouter_chat(system_prompt, user_text, max_retries=2):
+    """ONE call to OpenRouter Gemma 4 31B (free tier, 200 RPD).
+    Returns text or '(openrouter: ...)' error string."""
+    if not OPENROUTER_API_KEY:
+        return "(openrouter: not configured)"
+    body_dict = {
+        "model": OPENROUTER_CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": 0.3,
+    }
+    body_bytes = json.dumps(body_dict).encode()
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/vasthavdasari/telugu-telegram-bot-",
+        "X-Title": "Telugu Translator Bot",
+    }
+    for attempt in range(max_retries + 1):
+        try:
+            raw = _http_request(OPENROUTER_CHAT_URL, data=body_bytes, headers=headers, timeout=HTTP_TIMEOUT)
+            res = json.loads(raw)
+            text = res.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return text or "(openrouter: empty response)"
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}".replace("\n", " ")
+            if e.code == 429:
+                return f"(openrouter: {err})"
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[openrouter chat {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return f"(openrouter: {err})"
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(_retry_wait(attempt))
+                continue
+            return f"(openrouter: {e})"
+    return "(openrouter: retries exhausted)"
+
+
 # ---------- unified entrypoints with SEQUENTIAL fallback ----------
 # These are the only callers used by handle_message. On success, only 1 API call.
-# Fallback (2nd call) runs only if the primary returned an error.
+# Each fallback runs only if the prior provider returned an error.
 
 def translate_text(system_prompt, user_text):
-    """Try Gemini 2.5 Flash first (best Telugu quality). On error, fall back to Groq Llama 3.3 70B."""
+    """3-tier sequential cascade for text translation:
+       1) Gemini 2.5 Flash  (best Telugu per academic research)
+       2) OpenRouter Gemma 4 31B  (Gemini-3 architecture, 140+ langs)
+       3) Groq Llama 3.3 70B  (last resort — Telugu not in Meta's official list)
+    """
+    tried = []
     if GEMINI_API_KEY:
         result = gemini_translate(system_prompt, user_text)
         if not result.startswith("("):
             return result
-        print(f"[text: gemini failed ({result[:80]}); trying groq]", flush=True)
+        tried.append(f"gemini({result[:60]})")
+        print(f"[text: gemini failed ({result[:80]}); trying openrouter]", flush=True)
+    if OPENROUTER_API_KEY:
+        result = openrouter_chat(system_prompt, user_text)
+        if not result.startswith("("):
+            return result
+        tried.append(f"openrouter({result[:60]})")
+        print(f"[text: openrouter failed ({result[:80]}); trying groq]", flush=True)
     if GROQ_API_KEY:
-        return groq_chat(system_prompt, user_text)
-    return "(no provider succeeded)"
+        result = groq_chat(system_prompt, user_text)
+        if not result.startswith("("):
+            return result
+        tried.append(f"groq({result[:60]})")
+    return f"(all providers failed: {'; '.join(tried)[:250]})"
 
 
 def transcribe_voice(audio_bytes, filename):

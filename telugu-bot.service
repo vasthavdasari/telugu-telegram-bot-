@@ -1,0 +1,38 @@
+# systemd service file for the Telugu-English Telegram Translator Bot.
+#
+# One-time install on the VM (copy-paste in SSH):
+#   sudo cp ~/telugu_bot/telugu-bot.service /etc/systemd/system/telugu-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable telugu-bot
+#   sudo systemctl start telugu-bot
+#
+# After that, the bot auto-starts on VM boot and auto-restarts on crash.
+# To update code: `cd ~/telugu_bot && git pull && sudo systemctl restart telugu-bot`
+# To check logs:  `sudo journalctl -u telugu-bot -f`    (live tail, Ctrl+C to stop)
+# To stop:        `sudo systemctl stop telugu-bot`
+#
+# If you fork this to a different Linux user, replace "vasthav2580" below
+# with the output of `whoami` on your VM.
+
+[Unit]
+Description=Telugu-English Telegram Translator Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vasthav2580
+WorkingDirectory=/home/vasthav2580/telugu_bot
+EnvironmentFile=/home/vasthav2580/telugu_bot/.env
+ExecStart=/usr/bin/python3 /home/vasthav2580/telugu_bot/bot.py
+
+# Always restart if the bot exits (crash, network blip, etc.).
+Restart=always
+RestartSec=10
+
+# Logs go to the system journal — read with `journalctl -u telugu-bot -f`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

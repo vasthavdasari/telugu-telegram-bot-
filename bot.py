@@ -212,6 +212,27 @@ RIGHT (Telugu script + natural English loanwords):
 ABSOLUTE RULE — Telugu verbs/pronouns/conjunctions/particles MUST be Telugu script:
 If you find yourself about to write any Telugu word in Roman letters — especially verb forms ending in -anu, -ava, -avu, -aru, -adu, -indi, -undi, -nanu, -tava, -tunna, -tunnav, or pronouns like nuvvu/nenu/memu/meeru/vaallu, or conjunctions like kada/ani/ante/valla — STOP and rewrite that token in Telugu Unicode script. Only naturalized English nouns (price, shipping, item, camera, discount, phone, order, etc.) stay in Latin letters.
 
+COMMON ENGLISH LOANWORDS (EXPERIMENTAL — based on research of modern Telugu code-mixing).
+ALWAYS keep these words in English (Latin letters) when they appear in the input. Never translate them to Sanskrit-heavy Telugu equivalents:
+
+  Courtesy:      hello, hi, bye, please, sorry, thanks, thank you, ok, okay, welcome, yes, no
+  Commerce:      price, cost, shipping, delivery, payment, order, refund, return, discount, offer,
+                 item, brand, model, box, case, condition, original, genuine, used, new, available,
+                 free, cash, card, online, store, market, deal, quality, quantity, stock
+  Money:         dollar, dollars, rupees, USD, INR, amount, total
+  Tech/Comms:    phone, mobile, laptop, computer, internet, email, WhatsApp, message, website,
+                 link, app, notification, password, OTP, login, video, photo, screenshot, file
+  Logistics:     tracking, address, pincode, zipcode, courier, parcel, package, weight, size
+  Time:          morning, evening, today, tomorrow, AM, PM, minute, hour, second, week, month
+  Work/Places:   meeting, office, boss, client, project, plan, schedule, hospital, hotel, station
+  People:        friend, bro, sister, family, guys
+  Descriptors:   good, bad, nice, super, great, best, fine, awesome, cool, urgent, important,
+                 ready, final, fix, normal, small, big, full, empty, fresh, old
+  Common verbs:  ship, cancel, confirm, accept, reject, send, call, reply, update, check,
+                 order (as verb), pay, refund (as verb)
+
+This list reflects how urban Telugu speakers actually write on WhatsApp today. Use Telugu SCRIPT everywhere else.
+
 RULES:
 - Output ONLY the Telugu text. No prose, no explanation, no romanization, no quotation marks, no "Translation:" prefix.
 - TRANSLATE THE MEANING, not just individual words. Understand what the English message is really saying, then convey the same intent in Telugu.

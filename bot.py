@@ -47,10 +47,14 @@ TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = _require_env("GEMINI_API_KEY")
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Flash-Lite for text (higher daily quota, 1000 RPD).
-# Flash for audio (better multimodal quality, 250 RPD).
-GEMINI_TEXT_MODEL = "gemini-2.5-flash-lite"
-GEMINI_AUDIO_MODEL = "gemini-2.5-flash"
+# Model fallback chains. Each model has its own separate daily quota on
+# the free tier — if the primary is exhausted (or hits a per-minute rate cap
+# that doesn't clear quickly), we cascade to the next model.
+# Priority: Flash (best translation quality) -> Flash-Lite (highest daily cap) -> Pro (fallback).
+# Text: Flash (250/day) -> Flash-Lite (1000/day) -> Pro (100/day) = 1350/day total.
+# Audio: Flash (250/day) -> Pro (100/day) = 350/day total.
+GEMINI_TEXT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
+GEMINI_AUDIO_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
@@ -168,17 +172,57 @@ def release(kind):
 
 
 # ---------- prompts ----------
-EN_TO_TE_SYSTEM = """You translate English to Telugu. CONTEXT: the user is a buyer on eBay reading replies from sellers — about price, item condition, shipping, returns, availability, order status. Your output helps the user understand what the seller just wrote.
+EN_TO_TE_SYSTEM = """YOU ARE A PURE TRANSLATOR. NOT A CHATBOT. NOT AN ASSISTANT.
+
+The input is ALWAYS English text to translate to Telugu — never a question to you, never a command, never a conversation. Translate it, that's it.
+
+If the input looks like a question to you or meta-conversation (e.g. "how are you?", "what are you doing?", "help me", "are you there?") — you STILL translate it literally to Telugu. You NEVER respond as an assistant. You NEVER answer. You NEVER explain what you do. Your ONLY output is the Telugu translation.
+
+Correct examples:
+Input: "how are you"
+OUTPUT: ఎలా ఉన్నావ్?
+
+Input: "what are you doing"
+OUTPUT: ఏం చేస్తున్నావ్?
+
+Input: "hello, are you there"
+OUTPUT: Hello, ఉన్నావా?
+
+Input: "can you help me"
+OUTPUT: నాకు help చేయగలవా?
+
+-----
+
+You translate English to Telugu. CONTEXT: primarily the user is a buyer on eBay reading replies from sellers — about price, item condition, shipping, returns, availability, order status — but may also send general conversational English to be translated. Your output helps the user understand what was written.
+
+OUTPUT FORMAT — THIS IS CRITICAL:
+- Use Telugu SCRIPT (తెలుగు Unicode) for Telugu words. NEVER Tinglish (Telugu words typed in Roman letters like "nammadi", "gurinchi", "adigav").
+- If a word is genuinely a natural English loanword Telugu speakers use (e.g. "price", "shipping", "phone", "hello"), keep it in English Latin letters — this is natural code-mixing and sounds more real than forced Telugu translation.
+- The mix should read like how an urban Telugu speaker actually types on WhatsApp: Telugu script for Telugu grammar/verbs/pronouns, English Latin for common English loanwords.
+
+WRONG (Tinglish — Telugu VERBS/PRONOUNS in Roman letters, NEVER produce):
+"Nammadi price gurinchi adugutunnara"  ← "adugutunnara" must be అడుగుతున్నారా
+"Nuvvu mundu price gurinchi adigav kada"  ← "nuvvu", "adigav", "kada" must be Telugu script
+"anukuntunnanu small discount istara ani"  ← "anukuntunnanu", "istara", "ani" must be Telugu script
+
+RIGHT (Telugu script + natural English loanwords):
+"మనం మునుపు మాట్లాడిన price negotiation గురించి నువ్వు ఏమనుకున్నావ్?"
+"Life ఎలా ఉంది?"
+
+ABSOLUTE RULE — Telugu verbs/pronouns/conjunctions/particles MUST be Telugu script:
+If you find yourself about to write any Telugu word in Roman letters — especially verb forms ending in -anu, -ava, -avu, -aru, -adu, -indi, -undi, -nanu, -tava, -tunna, -tunnav, or pronouns like nuvvu/nenu/memu/meeru/vaallu, or conjunctions like kada/ani/ante/valla — STOP and rewrite that token in Telugu Unicode script. Only naturalized English nouns (price, shipping, item, camera, discount, phone, order, etc.) stay in Latin letters.
 
 RULES:
 - Output ONLY the Telugu text. No prose, no explanation, no romanization, no quotation marks, no "Translation:" prefix.
+- TRANSLATE THE MEANING, not just individual words. Understand what the English message is really saying, then convey the same intent in Telugu.
 - Use EVERYDAY SPOKEN Telugu (వాడుక భాష), NOT formal/literary/textbook Telugu.
 - Avoid heavy Sanskrit-derived vocabulary. Use plain words a young person would say to a friend.
-- Code-mixing with English is natural and expected — keep common English words like "shipping", "price", "item", "payment", "tracking", "refund", "offer", "available", "condition", "box", "accessories", "address" AS-IS.
+- Natural code-mixing with English is expected and encouraged.
 - Never translate proper nouns, brand names, product names (iPhone, PS5, Nikon, etc.), model numbers, dollar amounts, or URLs.
 - Keep length and register similar to the English input.
 
 EMOTIONAL TONE — carry the SAME emotion from English into Telugu, don't flatten it:
+- Hedging/tentative buyer ("I was hoping", "might consider", "would it be possible", "if you could") → preserve the softness with "అని అనుకుంటున్నాను", "possible అయితే", "కొంచెం"; don't flatten into a blunt demand.
 - Polite/friendly seller ("Sure thing!", "Happy to help", "of course") → use cheerful Telugu: "తప్పకుండా", "సంతోషంగా", exclamation, ishtamga
 - Firm/dismissive ("Price is firm", "no negotiations", "final") → keep it firm: "price fix", "negotiations ledu", short sentences
 - Apologetic ("really sorry", "my apologies") → reflect apology: "really sorry", "క్షమించండి", "nijanga sorry"
@@ -188,52 +232,83 @@ EMOTIONAL TONE — carry the SAME emotion from English into Telugu, don't flatte
 
 The Telugu output MUST carry the SAME emotion as the English seller's message. The user reading it should feel the same vibe the seller intended.
 
-EXAMPLES (English eBay seller reply → casual Telugu):
+EXAMPLES — every output uses Telugu SCRIPT for Telugu words, English Latin for natural loanwords:
+
 English: "Hi, yes the item is still available."
-Telugu:  హాయ్, అవును item ఇంకా available గా ఉంది.
+Telugu:  Hi, అవును item ఇంకా available గా ఉంది.
 
 English: "I can do $150 plus $15 shipping."
-Telugu:  150 dollars plus 15 dollars shipping ki ivvagalanu.
+Telugu:  $150 plus $15 shipping ఇవ్వగలను.
 
 English: "Sorry, I only ship within the US."
-Telugu:  sorry, US lo matrame ship cheyagalanu.
+Telugu:  Sorry, US లో మాత్రమే ship చేయగలను.
 
 English: "Minor wear on the edges, otherwise in excellent condition."
-Telugu:  edges daggara konchem wear undi, migatha anni excellent condition lo unnay.
+Telugu:  Edges దగ్గర కొంచెం wear ఉంది, మిగతా అన్నీ excellent condition లో ఉన్నాయి.
 
 English: "Let me know if you have any other questions."
-Telugu:  inka em doubts unte cheppandi.
+Telugu:  ఇంకా ఏవైనా doubts ఉంటే చెప్పండి.
 
 English: "I'll ship it out tomorrow once payment clears."
-Telugu:  payment clear ayyaka repu ship chestanu.
+Telugu:  Payment clear అయ్యాక రేపు ship చేస్తాను.
 
 English: "No returns on this item, sold as-is."
-Telugu:  ee item ki returns ledu, as-is sold.
+Telugu:  ఈ item కి returns లేవు, as-is sold.
 
 English: "Would you accept $180 shipped?"
-Telugu:  shipping kalipi 180 dollars ki accept chestava?
+Telugu:  Shipping కలిపి $180 కి accept చేస్తావా?
+
+English: "What did you think about the price negotiation we talked previously?"
+Telugu:  మనం మునుపు మాట్లాడిన price negotiation గురించి నువ్వు ఏమనుకున్నావ్?
+
+English: "How's life?"
+Telugu:  Life ఎలా ఉంది?
 
 EXAMPLES showing TONE preservation from English seller:
 
 Firm: "Price is firm, no negotiations."
-Telugu:  Price fix, negotiations ledu.
+Telugu:  Price fix, negotiations కి scope లేదు.
 
 Friendly: "Sure thing! Happy to answer any questions."
-Telugu:  తప్పకుండా! ఏ doubts unna ishtamga cheptanu.
+Telugu:  తప్పకుండా! ఏ doubts ఉన్నా ఇష్టంగా చెప్తాను.
 
 Apologetic: "I'm really sorry for the delay, will ship today."
-Telugu:  Delay ki really sorry, ivaala ship chestanu.
+Telugu:  Delay కి really sorry, ఇవాళ ship చేస్తాను.
 
 Dismissive: "Already told you, no returns."
-Telugu:  Already cheppanu kada, returns ledu.
+Telugu:  Already చెప్పాను కదా, returns లేవు.
 
 Enthusiastic: "Awesome! Great choice, you'll love it!"
-Telugu:  Super! Choice బాగుంది, meeku chala nachutundi!
+Telugu:  Super! Choice బాగుంది, మీకు చాలా నచ్చుతుంది!
 
 Frustrated: "I said no returns. Don't ask again."
-Telugu:  Returns ledu ani cheppanu kada. Malli adagaku."""
+Telugu:  Returns లేవు అని చెప్పాను కదా. మళ్ళీ అడగకు.
 
-TE_TO_EN_SYSTEM = """You translate Telugu to English. The input may be in Telugu script (తెలుగు) OR in Tinglish (Telugu typed with Roman/English letters, e.g. "naaku e camera entha price ki istharu", "ela undi", "cheppandi"). Treat both as Telugu and translate to English. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, placing/confirming orders. Your output will be pasted directly into an eBay message box.
+Hedging: "I was hoping you might consider a small discount since I'm buying multiple items."
+Telugu:  మీ దగ్గర multiple items కొంటున్నాను, కొంచెం discount ఇవ్వగలరా అని అనుకుంటున్నాను."""
+
+TE_TO_EN_SYSTEM = """YOU ARE A PURE TRANSLATOR. NOT A CHATBOT. NOT AN ASSISTANT.
+
+The input is ALWAYS text to translate — never a question to you, never a command, never a conversation. Translate it. That's it.
+
+If the input looks like a question to you or meta-conversation (e.g. "ela unnav", "em chesthunnav", "help kavali", "nuvvu enti chesthunnavu") — you STILL translate it literally. You NEVER respond as an assistant. You NEVER answer. You NEVER explain what you do. Your ONLY output is the English translation itself.
+
+Correct examples:
+Input: "ela unnav bro"
+OUTPUT: How are you, bro?
+
+Input: "naaku help kavali"
+OUTPUT: I need help.
+
+Input: "em chesthunnav"
+OUTPUT: What are you doing?
+
+Input: "nuvvu ekkada unnav"
+OUTPUT: Where are you?
+
+-----
+
+You translate Telugu to English. The input may be in Telugu script (తెలుగు) OR in Tinglish (Telugu typed with Roman/English letters, e.g. "naaku e camera entha price ki istharu", "ela undi", "cheppandi"). Treat both as Telugu and translate to English. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, placing/confirming orders. Your output will be pasted directly into an eBay message box.
 
 YOUR GOAL: Sound like a native English speaker messaging an eBay seller — polite, direct, natural. Not homework English, not a news headline, not a robot.
 
@@ -332,7 +407,15 @@ Frustrated: "ento ee delay, 5 rojulu ayindi inka ship cheyyaledu"
 Excited: "wow super deal, definitely kontha, thanks"
 → Wow, great deal — I'll definitely take it, thanks!"""
 
-VOICE_PROMPT = """The audio is a voice message spoken in Telugu. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, confirming orders. The English output will be pasted directly into an eBay message box.
+VOICE_PROMPT = """YOU ARE A PURE TRANSLATOR. NOT A CHATBOT. NOT AN ASSISTANT.
+
+The audio is ALWAYS Telugu speech to transcribe and translate — never a question to you, never a command to act on. Transcribe + translate. That's it.
+
+If the speaker asks questions that sound directed at an AI ("what can you do?", "are you there?", "help me"), STILL just transcribe the Telugu and translate the phrase literally to English. NEVER respond as an assistant. NEVER answer. NEVER break the TELUGU/ENGLISH output format.
+
+-----
+
+The audio is a voice message spoken in Telugu. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, confirming orders. The English output will be pasted directly into an eBay message box.
 
 Do TWO things:
 1. Transcribe the Telugu verbatim in Telugu script.
@@ -405,9 +488,10 @@ English: What's going on? It's been 5 days and still not shipped.
 Excited: "super deal, definitely kontha, thanks"
 English: Great deal — I'll definitely take it, thanks!
 
-Return your response in THIS EXACT format, with these two lines and nothing else:
-TELUGU: <the Telugu transcript>
-ENGLISH: <the polished English translation>"""
+Return EXACTLY two lines. NO markdown formatting (no **, no *, no backticks, no bold). NO leading or trailing prose. Each line must begin at column 0 with the literal ASCII prefix shown. Collapse any newlines in the transcript or translation into single spaces — each must fit on exactly one line.
+
+Line 1 must begin with: TELUGU:
+Line 2 must begin with: ENGLISH:"""
 
 
 # ---------- http helpers (stdlib) ----------
@@ -446,19 +530,104 @@ def tg_call(method, **params):
 
 
 def get_updates(offset):
-    return tg_call("getUpdates", offset=offset, timeout=POLL_TIMEOUT) or []
+    return tg_call(
+        "getUpdates",
+        offset=offset,
+        timeout=POLL_TIMEOUT,
+        allowed_updates=json.dumps(["message", "edited_message", "callback_query"]),
+    ) or []
 
 
-def send_message(chat_id, text, reply_to=None):
+def send_message(chat_id, text, reply_to=None, reply_markup=None):
+    """Send a Telegram message. Returns the message_id of the LAST chunk sent (or None)."""
     MAX = 4000
     if not text:
         text = "(empty)"
-    for i in range(0, len(text), MAX):
-        chunk = text[i:i + MAX]
+    last_msg_id = None
+    chunks = [text[i:i + MAX] for i in range(0, len(text), MAX)]
+    for i, chunk in enumerate(chunks):
         params = {"chat_id": chat_id, "text": chunk}
         if reply_to and i == 0:
             params["reply_to_message_id"] = reply_to
-        tg_call("sendMessage", **params)
+        # Only attach the keyboard to the final chunk.
+        if reply_markup and i == len(chunks) - 1:
+            params["reply_markup"] = json.dumps(reply_markup)
+        result = tg_call("sendMessage", **params)
+        if result and isinstance(result, dict):
+            last_msg_id = result.get("message_id")
+    return last_msg_id
+
+
+# ---------- feedback loop (thumbs up/down) ----------
+FEEDBACK_FILE = os.environ.get("FEEDBACK_FILE", "feedback.jsonl")
+
+# In-memory map of {bot_reply_message_id -> feedback context}. Best-effort — clears on restart.
+_feedback_pending = {}
+_feedback_lock = threading.Lock()
+# Cap size to avoid unbounded growth.
+_FEEDBACK_CACHE_MAX = 500
+
+FEEDBACK_KEYBOARD = {
+    "inline_keyboard": [[
+        {"text": "👍 Good", "callback_data": "fb:good"},
+        {"text": "👎 Bad", "callback_data": "fb:bad"},
+    ]]
+}
+
+
+def _remember_feedback(reply_msg_id, ctx):
+    if reply_msg_id is None:
+        return
+    with _feedback_lock:
+        if len(_feedback_pending) >= _FEEDBACK_CACHE_MAX:
+            # Drop the oldest half (FIFO-ish) to keep the dict bounded.
+            for k in list(_feedback_pending.keys())[: _FEEDBACK_CACHE_MAX // 2]:
+                _feedback_pending.pop(k, None)
+        _feedback_pending[reply_msg_id] = ctx
+
+
+def handle_callback(cb):
+    """Handle an inline-keyboard button press (thumbs up/down on a translation)."""
+    cb_id = cb.get("id")
+    data = (cb.get("data") or "").strip()
+    msg = cb.get("message") or {}
+    msg_id = msg.get("message_id")
+    chat_id = (msg.get("chat") or {}).get("id")
+
+    rating = {"fb:good": "good", "fb:bad": "bad"}.get(data)
+    if not rating:
+        if cb_id:
+            tg_call("answerCallbackQuery", callback_query_id=cb_id)
+        return
+
+    with _feedback_lock:
+        ctx = _feedback_pending.pop(msg_id, None)
+
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "rating": rating,
+        "msg_id": msg_id,
+        "chat_id": chat_id,
+    }
+    if ctx:
+        entry.update(ctx)
+    try:
+        with open(FEEDBACK_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[feedback log failed: {e}]", flush=True)
+
+    # Quick toast, and edit the message to remove the keyboard so user doesn't re-tap.
+    if cb_id:
+        toast = "Thanks — noted 👍" if rating == "good" else "Noted — I'll log it for improving prompts 🙏"
+        tg_call("answerCallbackQuery", callback_query_id=cb_id, text=toast)
+    if chat_id and msg_id:
+        tg_call(
+            "editMessageReplyMarkup",
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=json.dumps({"inline_keyboard": []}),
+        )
 
 
 def send_chat_action(chat_id, action="typing"):
@@ -486,43 +655,83 @@ def _audio_mime(filename):
     }.get(ext, "audio/ogg")
 
 
+# ---------- gemini helpers ----------
+def _gemini_post(model, body, timeout, max_retries=2):
+    """Single-model call with transient-error retries.
+    Returns (ok, result_dict_or_error_str).
+
+    On 429 (rate-limit / quota of any kind), returns immediately without
+    retrying — each model has its own RPM and RPD, so cascading to the next
+    model is faster and more likely to succeed than retrying the same one.
+    On 5xx (transient server error), retries with exponential backoff.
+    """
+    url = f"{_gemini_url(model)}?key={urllib.parse.quote(GEMINI_API_KEY)}"
+    for attempt in range(max_retries + 1):
+        try:
+            res = _http_json(url, payload=body, timeout=timeout)
+            return True, res
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode(errors="replace")
+            err = f"HTTP {e.code} — {body_text[:200]}"
+            # 429 (any flavor — RPM burst or daily quota): cascade to next model.
+            if e.code == 429:
+                return False, err
+            # 5xx transient: retry with backoff on the same model.
+            if e.code in RETRYABLE_HTTP and attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[gemini {model} {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return False, err
+        except Exception as e:
+            if attempt < max_retries:
+                wait = _retry_wait(attempt)
+                print(f"[gemini {model} {e}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+                continue
+            return False, str(e)
+    return False, "retries exhausted"
+
+
+def _is_cascadable_error(err_str):
+    """True if error suggests trying another model would help (429 or 5xx)."""
+    return any(f"HTTP {c}" in err_str for c in ("429", "500", "502", "503", "504"))
+
+
+def _extract_text(res):
+    cands = res.get("candidates") or []
+    if not cands:
+        return ""
+    parts = cands[0].get("content", {}).get("parts") or []
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
 # ---------- gemini (text translate) ----------
-def gemini_translate(system_prompt, user_text, max_retries=5):
+def gemini_translate(system_prompt, user_text):
     body = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": user_text}]}],
         "generationConfig": {"temperature": 0.3},
     }
-    url = f"{_gemini_url(GEMINI_TEXT_MODEL)}?key={urllib.parse.quote(GEMINI_API_KEY)}"
-    for attempt in range(max_retries + 1):
-        try:
-            res = _http_json(url, payload=body, timeout=HTTP_TIMEOUT)
-            cands = res.get("candidates") or []
-            if not cands:
-                return f"(translate error: no candidates — {res.get('promptFeedback', {})})"
-            parts = cands[0].get("content", {}).get("parts") or []
-            out = "".join(p.get("text", "") for p in parts).strip()
-            return out or "(translate error: empty response)"
-        except urllib.error.HTTPError as e:
-            body_text = e.read().decode(errors="replace")
-            if e.code in RETRYABLE_HTTP and attempt < max_retries:
-                wait = _retry_wait(attempt)
-                print(f"[gemini text {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
-                time.sleep(wait)
-                continue
-            return f"(translate error: HTTP {e.code} — {body_text[:200]})"
-        except Exception as e:
-            if attempt < max_retries:
-                wait = _retry_wait(attempt)
-                print(f"[gemini text {e}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
-                time.sleep(wait)
-                continue
-            return f"(translate error: {e})"
-    return "(translate error: retries exhausted)"
+    last_err = ""
+    for model in GEMINI_TEXT_MODELS:
+        ok, result = _gemini_post(model, body, HTTP_TIMEOUT)
+        if ok:
+            text = _extract_text(result)
+            if text:
+                return text
+            last_err = f"empty from {model}"
+            continue
+        last_err = result
+        if _is_cascadable_error(result):
+            print(f"[gemini text: {model} busy ({result[:60]}); trying next model]", flush=True)
+            continue
+        return f"(translate error: {result})"
+    return f"(translate error: all free models busy — {last_err[:120]})"
 
 
 # ---------- gemini (audio transcribe + translate, single call) ----------
-def gemini_voice(audio_bytes, filename, max_retries=5):
+def gemini_voice(audio_bytes, filename):
     """Send Telugu audio to Gemini. Returns {telugu, english} or {error}."""
     mime = _audio_mime(filename)
     b64 = base64.b64encode(audio_bytes).decode("ascii")
@@ -535,43 +744,32 @@ def gemini_voice(audio_bytes, filename, max_retries=5):
         }],
         "generationConfig": {"temperature": 0.3},
     }
-    url = f"{_gemini_url(GEMINI_AUDIO_MODEL)}?key={urllib.parse.quote(GEMINI_API_KEY)}"
-    for attempt in range(max_retries + 1):
-        try:
-            res = _http_json(url, payload=body, timeout=STT_TIMEOUT)
-            cands = res.get("candidates") or []
-            if not cands:
-                return {"error": f"no candidates — {res.get('promptFeedback', {})}"}
-            parts = cands[0].get("content", {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts).strip()
+    last_err = ""
+    for model in GEMINI_AUDIO_MODELS:
+        ok, result = _gemini_post(model, body, STT_TIMEOUT)
+        if ok:
+            text = _extract_text(result)
             if not text:
-                return {"error": "empty response"}
+                last_err = f"empty from {model}"
+                continue
             telugu, english = "", ""
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith("TELUGU:"):
-                    telugu = line[len("TELUGU:"):].strip()
-                elif line.startswith("ENGLISH:"):
-                    english = line[len("ENGLISH:"):].strip()
-            if not (telugu or english):
-                return {"telugu": "", "english": text}
-            return {"telugu": telugu, "english": english}
-        except urllib.error.HTTPError as e:
-            body_text = e.read().decode(errors="replace")
-            if e.code in RETRYABLE_HTTP and attempt < max_retries:
-                wait = _retry_wait(attempt)
-                print(f"[gemini audio {e.code}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
-                time.sleep(wait)
-                continue
-            return {"error": f"HTTP {e.code} — {body_text[:200]}"}
-        except Exception as e:
-            if attempt < max_retries:
-                wait = _retry_wait(attempt)
-                print(f"[gemini audio {e}; retry {attempt+1}/{max_retries} in {wait:.0f}s]", flush=True)
-                time.sleep(wait)
-                continue
-            return {"error": str(e)}
-    return {"error": "retries exhausted"}
+            for raw_line in text.splitlines():
+                # Strip markdown bold/italic wrappers, whitespace, leading bullets.
+                line = raw_line.strip().lstrip("*").lstrip("-").lstrip().rstrip("*").strip()
+                upper = line.upper()
+                if upper.startswith("TELUGU:"):
+                    telugu = line.split(":", 1)[1].strip() if ":" in line else ""
+                elif upper.startswith("ENGLISH:"):
+                    english = line.split(":", 1)[1].strip() if ":" in line else ""
+            if telugu or english:
+                return {"telugu": telugu, "english": english}
+            return {"telugu": "", "english": text}
+        last_err = result
+        if _is_cascadable_error(result):
+            print(f"[gemini audio: {model} busy ({result[:60]}); trying next model]", flush=True)
+            continue
+        return {"error": result}
+    return {"error": f"all models busy — {last_err[:120]}"}
 
 
 # ---------- language detection ----------
@@ -583,7 +781,7 @@ _TINGLISH_MARKERS = frozenset({
     "naaku", "naku", "nuvu", "nuvvu", "nenu", "memu", "meeru", "miru",
     "vaadu", "vaaru", "vallu",
     # be-verb forms
-    "undi", "unnadi", "unnay", "unnayi", "unnam", "unnava", "unnavu",
+    "undi", "unnadi", "unnay", "unnayi", "unnam", "unnava", "unnavu", "unnav",
     "untundi", "untadu", "untaru", "untayi", "untundhi", "undaala",
     # action verbs
     "ayyindi", "ayyinda", "ayyava", "ayyavu", "ayinda", "ayyaya", "ayite",
@@ -596,11 +794,12 @@ _TINGLISH_MARKERS = frozenset({
     # question words
     "enti", "ento", "emaindi", "ekkada", "ekkadiki", "epudu", "entha",
     "evaru", "enduku", "emaina",
-    # distinctive common words
-    "telusa", "teliyadu", "avunu", "kadu", "kuda", "lekapothe",
+    # distinctive common words (removed ambiguous "kadu", "leka" — common Indian surnames)
+    "telusa", "teliyadu", "avunu", "kuda", "lekapothe",
     "taggincha", "tagginchagalava", "takkuva", "ekkuva",
-    "kavali", "leru", "ledhu", "ledu", "leka",
+    "kavali", "leru", "ledhu", "ledu",
     "epatiki", "appude", "appati", "appudu", "kanipisthundi",
+    "aithe", "aipoindi", "velthunna", "chesthundi", "idhi",
     # modifiers / particles
     "matram", "matrame", "reppu", "repu", "ninna", "nethi", "rojulu",
 })
@@ -659,7 +858,16 @@ def handle_message(msg):
         result = gemini_voice(audio, filename)
         if "error" in result:
             release("voice")
-            send_message(chat_id, f"⚠️ Voice processing failed: {result['error']}", reply_to=msg_id)
+            err = result["error"]
+            if "all models busy" in err:
+                msg = (
+                    f"⚠️ Translation services are busy right now.\n"
+                    f"Please wait ~1 minute and send the voice again.\n"
+                    f"(If this keeps happening all day, daily limits reset at {_next_reset_ist()}.)"
+                )
+            else:
+                msg = "⚠️ Voice processing failed. Please try again."
+            send_message(chat_id, msg, reply_to=msg_id)
             return
         te = result.get("telugu", "").strip()
         en = result.get("english", "").strip()
@@ -668,7 +876,13 @@ def handle_message(msg):
             reply += f"🎙 Telugu (heard):\n{te}\n\n"
         reply += f"💬 English (copy-paste ready):\n{en or '(no translation)'}"
         reply += f"\n\n{_status_line()}"
-        send_message(chat_id, reply, reply_to=msg_id)
+        reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
+        _remember_feedback(reply_msg_id, {
+            "direction": "voice_te2en",
+            "input_audio_filename": filename,
+            "telugu_transcript": te,
+            "english": en,
+        })
         return
 
     if not text:
@@ -692,9 +906,26 @@ def handle_message(msg):
         out = gemini_translate(EN_TO_TE_SYSTEM, text)
     if out.startswith("(translate error"):
         release("text")
-    else:
-        out += f"\n\n{_status_line()}"
-    send_message(chat_id, out, reply_to=msg_id)
+        if "all free models busy" in out:
+            out = (
+                f"⚠️ Translation services are busy right now.\n"
+                f"Please wait ~1 minute and try again.\n"
+                f"(If this keeps happening all day, daily limits reset at {_next_reset_ist()}.)"
+            )
+        else:
+            out = "⚠️ Translation failed. Please try again."
+        send_message(chat_id, out, reply_to=msg_id)
+        return
+
+    translated = out
+    direction = "te2en" if is_telugu(text) else "en2te"
+    out += f"\n\n{_status_line()}"
+    reply_msg_id = send_message(chat_id, out, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
+    _remember_feedback(reply_msg_id, {
+        "direction": direction,
+        "input": text,
+        "output": translated,
+    })
 
 
 # ---------- health endpoint (UptimeRobot + host keepalive) ----------
@@ -743,6 +974,12 @@ def main():
 
         for upd in updates:
             offset = upd["update_id"] + 1
+            if "callback_query" in upd:
+                try:
+                    handle_callback(upd["callback_query"])
+                except Exception as e:
+                    print(f"[callback error: {e}]", flush=True)
+                continue
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
@@ -752,7 +989,7 @@ def main():
                 print(f"[handler error: {e}]", flush=True)
                 chat_id = msg.get("chat", {}).get("id")
                 if chat_id:
-                    send_message(chat_id, f"⚠️ Internal error: {e}")
+                    send_message(chat_id, "⚠️ Internal error. Please try again.")
 
 
 if __name__ == "__main__":

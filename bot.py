@@ -693,7 +693,8 @@ def _gemini_post(model, body, timeout, max_retries=2):
             return True, res
         except urllib.error.HTTPError as e:
             body_text = e.read().decode(errors="replace")
-            err = f"HTTP {e.code} — {body_text[:200]}"
+            # Keep full body in logs so we can diagnose 429 flavors (RPM vs RPD).
+            err = f"HTTP {e.code} — {body_text[:800]}".replace("\n", " ")
             # 429 (any flavor — RPM burst or daily quota): cascade to next model.
             if e.code == 429:
                 return False, err
@@ -745,7 +746,7 @@ def gemini_translate(system_prompt, user_text):
             continue
         last_err = result
         if _is_cascadable_error(result):
-            print(f"[gemini text: {model} busy ({result[:60]}); trying next model]", flush=True)
+            print(f"[gemini text: {model} busy ({result[:500]}); trying next model]", flush=True)
             continue
         return f"(translate error: {result})"
     return f"(translate error: all free models busy — {last_err[:120]})"
@@ -787,7 +788,7 @@ def gemini_voice(audio_bytes, filename):
             return {"telugu": "", "english": text}
         last_err = result
         if _is_cascadable_error(result):
-            print(f"[gemini audio: {model} busy ({result[:60]}); trying next model]", flush=True)
+            print(f"[gemini audio: {model} busy ({result[:500]}); trying next model]", flush=True)
             continue
         return {"error": result}
     return {"error": f"all models busy — {last_err[:120]}"}

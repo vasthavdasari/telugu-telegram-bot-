@@ -203,7 +203,7 @@ Telugu:  ee item ki returns ledu, as-is sold.
 English: "Would you accept $180 shipped?"
 Telugu:  shipping kalipi 180 dollars ki accept chestava?"""
 
-TE_TO_EN_SYSTEM = """You translate Telugu to English. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, placing/confirming orders. Your output will be pasted directly into an eBay message box.
+TE_TO_EN_SYSTEM = """You translate Telugu to English. The input may be in Telugu script (తెలుగు) OR in Tinglish (Telugu typed with Roman/English letters, e.g. "naaku e camera entha price ki istharu", "ela undi", "cheppandi"). Treat both as Telugu and translate to English. CONTEXT: the user is a buyer on eBay messaging sellers — asking about price, item condition, shipping, making offers, placing/confirming orders. Your output will be pasted directly into an eBay message box.
 
 YOUR GOAL: Sound like a native English speaker messaging an eBay seller — polite, direct, natural. Not homework English, not a news headline, not a robot.
 
@@ -477,8 +477,48 @@ def gemini_voice(audio_bytes, filename, max_retries=5):
 
 
 # ---------- language detection ----------
+# Distinctive Telugu function words that appear in Tinglish (Telugu typed in
+# Roman letters). If any of these tokens appears, treat the message as Telugu.
+# Kept to words unlikely to collide with common English / brand names.
+_TINGLISH_MARKERS = frozenset({
+    # pronouns
+    "naaku", "naku", "nuvu", "nuvvu", "nenu", "memu", "meeru", "miru",
+    "vaadu", "vaaru", "vallu",
+    # be-verb forms
+    "undi", "unnadi", "unnay", "unnayi", "unnam", "unnava", "unnavu",
+    "untundi", "untadu", "untaru", "untayi", "untundhi", "undaala",
+    # action verbs
+    "ayyindi", "ayyinda", "ayyava", "ayyavu", "ayinda", "ayyaya", "ayite",
+    "vacchindi", "vacchindhi", "vastunna", "vasthava", "vacchav", "vastanu",
+    "cheppu", "cheppandi", "cheppava", "cheppadu", "chepthunnanu",
+    "chepputhunnanu",
+    "chestava", "chestaru", "chestara", "chestavu", "chestaanu",
+    "chesthunnanu", "chesindhi", "chesthunnav", "cheste", "chesinna",
+    "istaru", "istharu", "istundi", "ichestha", "ichhesta", "ichindi",
+    # question words
+    "enti", "ento", "emaindi", "ekkada", "ekkadiki", "epudu", "entha",
+    "evaru", "enduku", "emaina",
+    # distinctive common words
+    "telusa", "teliyadu", "avunu", "kadu", "kuda", "lekapothe",
+    "taggincha", "tagginchagalava", "takkuva", "ekkuva",
+    "kavali", "leru", "ledhu", "ledu", "leka",
+    "epatiki", "appude", "appati", "appudu", "kanipisthundi",
+    # modifiers / particles
+    "matram", "matrame", "reppu", "repu", "ninna", "nethi", "rojulu",
+})
+
+
 def is_telugu(text):
-    return any("ఀ" <= c <= "౿" for c in text)
+    """Return True if text is Telugu — Telugu script OR Tinglish (Telugu typed in Roman letters)."""
+    # Telugu Unicode script
+    if any("ఀ" <= c <= "౿" for c in text):
+        return True
+    # Tinglish: at least one distinctive Telugu marker word
+    words = {
+        w.strip(".,!?;:()[]{}'\"-").lower()
+        for w in text.split()
+    }
+    return bool(words & _TINGLISH_MARKERS)
 
 
 # ---------- handler ----------

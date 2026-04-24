@@ -8,3 +8,4 @@ venv/
 *.log
 feedback.jsonl
 usage.json
+stats.json

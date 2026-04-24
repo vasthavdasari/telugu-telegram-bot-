@@ -120,6 +120,66 @@ def _retry_wait(attempt):
     return min(5.0 * (2 ** attempt), 90.0)
 
 
+# ---------- lifetime usage stats (shared across all users of this bot) ----------
+STATS_FILE = os.environ.get("STATS_FILE", "stats.json")
+_stats_lock = threading.Lock()
+
+
+def _load_stats():
+    try:
+        with open(STATS_FILE) as f:
+            d = json.load(f)
+            return {
+                "text": int(d.get("text", 0)),
+                "voice": int(d.get("voice", 0)),
+                "voice_seconds": int(d.get("voice_seconds", 0)),
+            }
+    except Exception:
+        return {"text": 0, "voice": 0, "voice_seconds": 0}
+
+
+def _save_stats(d):
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"[stats save failed: {e}]", flush=True)
+
+
+def bump_stats(kind, seconds=0):
+    """Increment cumulative lifetime counters. Returns updated dict for display."""
+    with _stats_lock:
+        d = _load_stats()
+        if kind == "text":
+            d["text"] += 1
+        elif kind == "voice":
+            d["voice"] += 1
+            d["voice_seconds"] += int(seconds or 0)
+        _save_stats(d)
+        return d
+
+
+def _format_duration(secs):
+    secs = int(secs or 0)
+    if secs < 60:
+        return f"{secs}s"
+    mins, s = divmod(secs, 60)
+    if s == 0:
+        return f"{mins}m"
+    return f"{mins}m {s}s"
+
+
+def _stats_line(d=None):
+    """One-line summary of lifetime bot usage (shared across all users)."""
+    if d is None:
+        with _stats_lock:
+            d = _load_stats()
+    return (
+        f"📊 Bot total: {d['text']} text · "
+        f"{d['voice']} voice ({_format_duration(d['voice_seconds'])})"
+    )
+
+
 # ---------- prompts ----------
 EN_TO_TE_SYSTEM = """YOU ARE A PURE TRANSLATOR. NOT A CHATBOT. NOT AN ASSISTANT.
 
@@ -1102,6 +1162,7 @@ def handle_message(msg):
 
     voice = msg.get("voice") or msg.get("audio")
     if voice:
+        duration_secs = int(voice.get("duration") or 0)
         send_chat_action(chat_id, "typing")
         filename, audio = download_voice(voice["file_id"])
         if not audio:
@@ -1132,6 +1193,7 @@ def handle_message(msg):
             else:
                 polish_model = "failed"
 
+        stats = bump_stats("voice", seconds=duration_secs)
         reply = ""
         if te:
             reply += f"🎙 Telugu (heard):\n{te}\n\n"
@@ -1141,13 +1203,14 @@ def handle_message(msg):
             model_line += f" + {polish_model}"
         elif polish_model == "failed":
             model_line += " (polish failed)"
-        reply += f"\n\n{model_line}"
+        reply += f"\n\n{model_line}\n{_stats_line(stats)}"
         reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
         _remember_feedback(reply_msg_id, {
             "direction": "voice_te2en",
             "input_audio_filename": filename,
             "telugu_transcript": te,
             "english": en,
+            "duration_seconds": duration_secs,
             "transcribe_model": transcribe_model,
             "polish_model": polish_model,
         })
@@ -1172,7 +1235,8 @@ def handle_message(msg):
 
     translated = result["text"]
     model_label = result["model"]
-    reply = f"{translated}\n\n🤖 {model_label}"
+    stats = bump_stats("text")
+    reply = f"{translated}\n\n🤖 {model_label}\n{_stats_line(stats)}"
     reply_msg_id = send_message(chat_id, reply, reply_to=msg_id, reply_markup=FEEDBACK_KEYBOARD)
     _remember_feedback(reply_msg_id, {
         "direction": direction,
